@@ -4,35 +4,37 @@
 #include <math.h>
 #include <chrono>
 
-void initMatrix(float* A, int n)
+#define DEFAULT_BLOCK_WIDTH 16
+
+void initMatrix(float* A, int Width)
 {
-    for (int i = 0; i < n * n; i++)
+    for (int i = 0; i < Width * Width; i++)
     {
         A[i] = (float)rand() / RAND_MAX;
     }
 }
 
-void cpuMatMul(float* P, const float* M, const float* N, int n)
+void cpuMatrixMul(float* M, float* N, float* P, int Width)
 {
-    for (int row = 0; row < n; row++)
+    for (int Row = 0; Row < Width; Row++)
     {
-        for (int col = 0; col < n; col++)
+        for (int Col = 0; Col < Width; Col++)
         {
-            float sum = 0.0f;
+            float Pvalue = 0.0f;
 
-            for (int k = 0; k < n; k++)
+            for (int k = 0; k < Width; k++)
             {
-                sum += M[row * n + k] * N[k * n + col];
+                Pvalue += M[Row * Width + k] * N[k * Width + Col];
             }
 
-            P[row * n + col] = sum;
+            P[Row * Width + Col] = Pvalue;
         }
     }
 }
 
-bool compareMatrices(const float* A, const float* B, int n, float tol)
+bool compareMatrices(const float* A, const float* B, int Width, float tol)
 {
-    for (int i = 0; i < n * n; i++)
+    for (int i = 0; i < Width * Width; i++)
     {
         if (fabs(A[i] - B[i]) > tol)
         {
@@ -42,96 +44,117 @@ bool compareMatrices(const float* A, const float* B, int n, float tol)
     return true;
 }
 
-__global__ void gpuMatMulKernel(float* P, const float* M, const float* N, int n)
+// Basic lecture-style kernel: one thread computes one output element
+__global__ void MatrixMulKernel(float* M, float* N, float* P, int Width)
 {
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int Row = blockIdx.y * blockDim.y + threadIdx.y;
+    int Col = blockIdx.x * blockDim.x + threadIdx.x;
 
-    if (row < n && col < n)
+    if (Row < Width && Col < Width)
     {
-        float sum = 0.0f;
+        float Pvalue = 0.0f;
 
-        for (int k = 0; k < n; k++)
+        for (int k = 0; k < Width; k++)
         {
-            sum += M[row * n + k] * N[k * n + col];
+            Pvalue += M[Row * Width + k] * N[k * Width + Col];
         }
 
-        P[row * n + col] = sum;
+        P[Row * Width + Col] = Pvalue;
     }
 }
 
-__global__ void gpuMatMulSingleThreadKernel(float* P, const float* M, const float* N, int n)
+// Kept only because your assignment wants a 1-block 1-thread comparison
+__global__ void MatrixMulSingleThreadKernel(float* M, float* N, float* P, int Width)
 {
-    for (int row = 0; row < n; row++)
+    for (int Row = 0; Row < Width; Row++)
     {
-        for (int col = 0; col < n; col++)
+        for (int Col = 0; Col < Width; Col++)
         {
-            float sum = 0.0f;
+            float Pvalue = 0.0f;
 
-            for (int k = 0; k < n; k++)
+            for (int k = 0; k < Width; k++)
             {
-                sum += M[row * n + k] * N[k * n + col];
+                Pvalue += M[Row * Width + k] * N[k * Width + Col];
             }
 
-            P[row * n + col] = sum;
+            P[Row * Width + Col] = Pvalue;
         }
     }
 }
 
-void gpuMatMul(float* P, const float* M, const float* N, int n)
+// Tiled shared-memory kernel for block-width experiments
+__global__ void TiledMatrixMulKernel(float* M, float* N, float* P, int Width, int TILE_WIDTH)
 {
-    float* d_M;
-    float* d_N;
-    float* d_P;
+    extern __shared__ float sharedMem[];
 
-    size_t bytes = n * n * sizeof(float);
+    float* Mds = sharedMem;
+    float* Nds = &sharedMem[TILE_WIDTH * TILE_WIDTH];
 
-    cudaMalloc((void**)&d_M, bytes);
-    cudaMalloc((void**)&d_N, bytes);
-    cudaMalloc((void**)&d_P, bytes);
+    int bx = blockIdx.x;
+    int by = blockIdx.y;
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
 
-    cudaMemcpy(d_M, M, bytes, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_N, N, bytes, cudaMemcpyHostToDevice);
+    int Row = by * TILE_WIDTH + ty;
+    int Col = bx * TILE_WIDTH + tx;
 
-    dim3 block(16, 16);
-    dim3 grid((n + 15) / 16, (n + 15) / 16);
+    float Pvalue = 0.0f;
+    int numPhases = (Width + TILE_WIDTH - 1) / TILE_WIDTH;
 
-    gpuMatMulKernel << <grid, block >> > (d_P, d_M, d_N, n);
+    for (int ph = 0; ph < numPhases; ph++)
+    {
+        int tiledCol = ph * TILE_WIDTH + tx;
+        int tiledRow = ph * TILE_WIDTH + ty;
 
-    cudaDeviceSynchronize();
+        if (Row < Width && tiledCol < Width)
+            Mds[ty * TILE_WIDTH + tx] = M[Row * Width + tiledCol];
+        else
+            Mds[ty * TILE_WIDTH + tx] = 0.0f;
 
-    cudaMemcpy(P, d_P, bytes, cudaMemcpyDeviceToHost);
+        if (tiledRow < Width && Col < Width)
+            Nds[ty * TILE_WIDTH + tx] = N[tiledRow * Width + Col];
+        else
+            Nds[ty * TILE_WIDTH + tx] = 0.0f;
 
-    cudaFree(d_M);
-    cudaFree(d_N);
-    cudaFree(d_P);
+        __syncthreads();
+
+        for (int k = 0; k < TILE_WIDTH; k++)
+        {
+            Pvalue += Mds[ty * TILE_WIDTH + k] * Nds[k * TILE_WIDTH + tx];
+        }
+
+        __syncthreads();
+    }
+
+    if (Row < Width && Col < Width)
+    {
+        P[Row * Width + Col] = Pvalue;
+    }
 }
 
-float measureHostToDeviceTime(const float* M, const float* N, int n)
+float measureHostToDeviceTime(const float* h_M, const float* h_N, int Width)
 {
     float* d_M;
     float* d_N;
 
-    size_t bytes = n * n * sizeof(float);
+    size_t size = Width * Width * sizeof(float);
 
-    cudaMalloc((void**)&d_M, bytes);
-    cudaMalloc((void**)&d_N, bytes);
+    cudaMalloc((void**)&d_M, size);
+    cudaMalloc((void**)&d_N, size);
 
     cudaEvent_t start, stop;
-
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
 
     cudaEventRecord(start);
 
-    cudaMemcpy(d_M, M, bytes, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_N, N, bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_M, h_M, size, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_N, h_N, size, cudaMemcpyHostToDevice);
 
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
 
     float ms = 0.0f;
-
     cudaEventElapsedTime(&ms, start, stop);
 
     cudaEventDestroy(start);
@@ -143,34 +166,32 @@ float measureHostToDeviceTime(const float* M, const float* N, int n)
     return ms;
 }
 
-float measureDeviceToHostTime(float* M, float* N, int n)
+float measureDeviceToHostTime(float* h_M, float* h_N, int Width)
 {
     float* d_M;
     float* d_N;
 
-    size_t bytes = n * n * sizeof(float);
+    size_t size = Width * Width * sizeof(float);
 
-    cudaMalloc((void**)&d_M, bytes);
-    cudaMalloc((void**)&d_N, bytes);
+    cudaMalloc((void**)&d_M, size);
+    cudaMalloc((void**)&d_N, size);
 
-    cudaMemcpy(d_M, M, bytes, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_N, N, bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_M, h_M, size, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_N, h_N, size, cudaMemcpyHostToDevice);
 
     cudaEvent_t start, stop;
-
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
 
     cudaEventRecord(start);
 
-    cudaMemcpy(M, d_M, bytes, cudaMemcpyDeviceToHost);
-    cudaMemcpy(N, d_N, bytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_M, d_M, size, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_N, d_N, size, cudaMemcpyDeviceToHost);
 
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
 
     float ms = 0.0f;
-
     cudaEventElapsedTime(&ms, start, stop);
 
     cudaEventDestroy(start);
@@ -182,36 +203,34 @@ float measureDeviceToHostTime(float* M, float* N, int n)
     return ms;
 }
 
-double measureCpuTime(const float* M, const float* N, float* P, int n)
+double measureCpuTime(float* h_M, float* h_N, float* h_P, int Width)
 {
     auto start = std::chrono::high_resolution_clock::now();
 
-    cpuMatMul(P, M, N, n);
+    cpuMatrixMul(h_M, h_N, h_P, Width);
 
     auto stop = std::chrono::high_resolution_clock::now();
 
     std::chrono::duration<double, std::milli> elapsed = stop - start;
-
     return elapsed.count();
 }
 
-float measureGpuKernelTime(const float* M, const float* N, int n, int blockWidth, bool singleThread)
+float measureGpuKernelTime(const float* h_M, const float* h_N, int Width, int blockWidth, bool singleThread, bool tiled)
 {
     float* d_M;
     float* d_N;
     float* d_P;
 
-    size_t bytes = n * n * sizeof(float);
+    size_t size = Width * Width * sizeof(float);
 
-    cudaMalloc((void**)&d_M, bytes);
-    cudaMalloc((void**)&d_N, bytes);
-    cudaMalloc((void**)&d_P, bytes);
+    cudaMalloc((void**)&d_M, size);
+    cudaMalloc((void**)&d_N, size);
+    cudaMalloc((void**)&d_P, size);
 
-    cudaMemcpy(d_M, M, bytes, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_N, N, bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_M, h_M, size, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_N, h_N, size, cudaMemcpyHostToDevice);
 
     cudaEvent_t start, stop;
-
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
 
@@ -219,25 +238,33 @@ float measureGpuKernelTime(const float* M, const float* N, int n, int blockWidth
 
     if (singleThread)
     {
-        gpuMatMulSingleThreadKernel << <1, 1 >> > (d_P, d_M, d_N, n);
+        MatrixMulSingleThreadKernel<<<1, 1>>>(d_M, d_N, d_P, Width);
+    }
+    else if (tiled)
+    {
+        int NumBlocks = (Width + blockWidth - 1) / blockWidth;
+
+        dim3 dimGrid(NumBlocks, NumBlocks);
+        dim3 dimBlock(blockWidth, blockWidth);
+
+        size_t sharedMemSize = 2 * blockWidth * blockWidth * sizeof(float);
+
+        TiledMatrixMulKernel<<<dimGrid, dimBlock, sharedMemSize>>>(d_M, d_N, d_P, Width, blockWidth);
     }
     else
     {
-        dim3 block(blockWidth, blockWidth);
+        int NumBlocks = (Width + blockWidth - 1) / blockWidth;
 
-        dim3 grid(
-            (n + blockWidth - 1) / blockWidth,
-            (n + blockWidth - 1) / blockWidth
-        );
+        dim3 dimGrid(NumBlocks, NumBlocks);
+        dim3 dimBlock(blockWidth, blockWidth);
 
-        gpuMatMulKernel << <grid, block >> > (d_P, d_M, d_N, n);
+        MatrixMulKernel<<<dimGrid, dimBlock>>>(d_M, d_N, d_P, Width);
     }
 
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
 
     float ms = 0.0f;
-
     cudaEventElapsedTime(&ms, start, stop);
 
     cudaEventDestroy(start);
@@ -254,21 +281,45 @@ int main()
 {
     srand(0);
 
-    int n = 300;
-    size_t bytes = n * n * sizeof(float);
+    // Correctness test
+    int Width = 300;
+    size_t size = Width * Width * sizeof(float);
 
-    float* M = (float*)malloc(bytes);
-    float* N = (float*)malloc(bytes);
-    float* P_cpu = (float*)malloc(bytes);
-    float* P_gpu = (float*)malloc(bytes);
+    float* M = (float*)malloc(size);
+    float* N = (float*)malloc(size);
+    float* P_cpu = (float*)malloc(size);
+    float* P_gpu = (float*)malloc(size);
 
-    initMatrix(M, n);
-    initMatrix(N, n);
+    initMatrix(M, Width);
+    initMatrix(N, Width);
 
-    cpuMatMul(P_cpu, M, N, n);
-    gpuMatMul(P_gpu, M, N, n);
+    cpuMatrixMul(M, N, P_cpu, Width);
 
-    if (compareMatrices(P_cpu, P_gpu, n, 1e-3f))
+    float* d_M;
+    float* d_N;
+    float* d_P;
+
+    cudaMalloc((void**)&d_M, size);
+    cudaMalloc((void**)&d_N, size);
+    cudaMalloc((void**)&d_P, size);
+
+    cudaMemcpy(d_M, M, size, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_N, N, size, cudaMemcpyHostToDevice);
+
+    int NumBlocks = (Width + DEFAULT_BLOCK_WIDTH - 1) / DEFAULT_BLOCK_WIDTH;
+    dim3 dimGrid(NumBlocks, NumBlocks);
+    dim3 dimBlock(DEFAULT_BLOCK_WIDTH, DEFAULT_BLOCK_WIDTH);
+
+    MatrixMulKernel<<<dimGrid, dimBlock>>>(d_M, d_N, d_P, Width);
+    cudaDeviceSynchronize();
+
+    cudaMemcpy(P_gpu, d_P, size, cudaMemcpyDeviceToHost);
+
+    cudaFree(d_M);
+    cudaFree(d_N);
+    cudaFree(d_P);
+
+    if (compareMatrices(P_cpu, P_gpu, Width, 1e-3f))
         printf("Test PASSED\n");
     else
         printf("Test FAILED\n");
@@ -278,6 +329,7 @@ int main()
     free(P_cpu);
     free(P_gpu);
 
+    // Part (a)
     int sizesA[5] = { 300, 750, 1500, 3000, 4500 };
 
     printf("\nPart (a):\n");
@@ -285,24 +337,25 @@ int main()
 
     for (int i = 0; i < 5; i++)
     {
-        int size = sizesA[i];
-        size_t bytesA = size * size * sizeof(float);
+        int WidthA = sizesA[i];
+        size_t sizeA = WidthA * WidthA * sizeof(float);
 
-        float* A = (float*)malloc(bytesA);
-        float* B = (float*)malloc(bytesA);
+        float* A = (float*)malloc(sizeA);
+        float* B = (float*)malloc(sizeA);
 
-        initMatrix(A, size);
-        initMatrix(B, size);
+        initMatrix(A, WidthA);
+        initMatrix(B, WidthA);
 
-        float h2d = measureHostToDeviceTime(A, B, size);
-        float d2h = measureDeviceToHostTime(A, B, size);
+        float h2d = measureHostToDeviceTime(A, B, WidthA);
+        float d2h = measureDeviceToHostTime(A, B, WidthA);
 
-        printf("%d, %.6f, %.6f\n", size, h2d, d2h);
+        printf("%d, %.6f, %.6f\n", WidthA, h2d, d2h);
 
         free(A);
         free(B);
     }
 
+    // Part (b)
     int sizesB[2] = { 300, 750 };
 
     printf("\nPart (b):\n");
@@ -310,27 +363,28 @@ int main()
 
     for (int i = 0; i < 2; i++)
     {
-        int size = sizesB[i];
-        size_t bytesB = size * size * sizeof(float);
+        int WidthB = sizesB[i];
+        size_t sizeB = WidthB * WidthB * sizeof(float);
 
-        float* A = (float*)malloc(bytesB);
-        float* B = (float*)malloc(bytesB);
-        float* P = (float*)malloc(bytesB);
+        float* A = (float*)malloc(sizeB);
+        float* B = (float*)malloc(sizeB);
+        float* P = (float*)malloc(sizeB);
 
-        initMatrix(A, size);
-        initMatrix(B, size);
+        initMatrix(A, WidthB);
+        initMatrix(B, WidthB);
 
-        double cpuTime = measureCpuTime(A, B, P, size);
-        float gpu1 = measureGpuKernelTime(A, B, size, 1, true);
-        float gpu2 = measureGpuKernelTime(A, B, size, 1, false);
+        double cpuTime = measureCpuTime(A, B, P, WidthB);
+        float gpu1 = measureGpuKernelTime(A, B, WidthB, 1, true, false);
+        float gpu2 = measureGpuKernelTime(A, B, WidthB, 1, false, false);
 
-        printf("%d, %.6f, %.6f, %.6f\n", size, cpuTime, gpu1, gpu2);
+        printf("%d, %.6f, %.6f, %.6f\n", WidthB, cpuTime, gpu1, gpu2);
 
         free(A);
         free(B);
         free(P);
     }
 
+    // Part (c)
     int sizesC[5] = { 300, 750, 1500, 3000, 4500 };
     int blockWidths[5] = { 2, 5, 10, 15, 25 };
 
@@ -339,22 +393,21 @@ int main()
 
     for (int i = 0; i < 5; i++)
     {
-        int size = sizesC[i];
-        size_t bytesC = size * size * sizeof(float);
+        int WidthC = sizesC[i];
+        size_t sizeC = WidthC * WidthC * sizeof(float);
 
-        float* A = (float*)malloc(bytesC);
-        float* B = (float*)malloc(bytesC);
+        float* A = (float*)malloc(sizeC);
+        float* B = (float*)malloc(sizeC);
 
-        initMatrix(A, size);
-        initMatrix(B, size);
+        initMatrix(A, WidthC);
+        initMatrix(B, WidthC);
 
         for (int j = 0; j < 5; j++)
         {
             int bw = blockWidths[j];
+            float time = measureGpuKernelTime(A, B, WidthC, bw, false, true);
 
-            float time = measureGpuKernelTime(A, B, size, bw, false);
-
-            printf("%d, %d, %.6f\n", size, bw, time);
+            printf("%d, %d, %.6f\n", WidthC, bw, time);
         }
 
         free(A);
