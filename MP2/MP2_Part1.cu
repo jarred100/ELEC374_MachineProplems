@@ -1,10 +1,13 @@
+// Jarred Brown
+// 20395573
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <cuda_runtime.h>
 #include <math.h>
 
-#define TILE_WIDTH 10
 #define TOL 1e-2f
+#define MAX_TILE 25   // Maximum tile size allowed
 
 void initMatrix(float* A, int n)
 {
@@ -36,10 +39,10 @@ int checkResult(const float* A, const float* B, int n)
     return 1;
 }
 
-__global__ void MatrixMulKernel(float* M, float* N, float* P, int Width)
+__global__ void MatrixMulKernel(float* M, float* N, float* P, int Width, int TILE_WIDTH)
 {
-    __shared__ float Mds[TILE_WIDTH][TILE_WIDTH];
-    __shared__ float Nds[TILE_WIDTH][TILE_WIDTH];
+    __shared__ float Mds[MAX_TILE][MAX_TILE];
+    __shared__ float Nds[MAX_TILE][MAX_TILE];
 
     int tx = threadIdx.x;
     int ty = threadIdx.y;
@@ -74,9 +77,9 @@ __global__ void MatrixMulKernel(float* M, float* N, float* P, int Width)
         P[Row * Width + Col] = Pvalue;
 }
 
-void matrixMultiply(float* h_P, float* h_M, float* h_N, int Width)
+void matrixMultiply(float* h_P, float* h_M, float* h_N, int Width, int TILE_WIDTH)
 {
-    float *d_M, *d_N, *d_P;
+    float* d_M, * d_N, * d_P;
     int size = Width * Width * sizeof(float);
 
     cudaMalloc((void**)&d_M, size);
@@ -97,7 +100,7 @@ void matrixMultiply(float* h_P, float* h_M, float* h_N, int Width)
     cudaEventCreate(&stop);
 
     cudaEventRecord(start);
-    MatrixMulKernel<<<dimGrid, dimBlock>>>(d_M, d_N, d_P, Width);
+    MatrixMulKernel << <dimGrid, dimBlock >> > (d_M, d_N, d_P, Width, TILE_WIDTH);
     cudaEventRecord(stop);
 
     cudaEventSynchronize(stop);
@@ -117,9 +120,10 @@ void matrixMultiply(float* h_P, float* h_M, float* h_N, int Width)
 
 int main()
 {
-    int sizes[] = {300, 750, 1500, 3000, 4500};
+    int sizes[] = { 300, 750, 1500, 3000, 4500 };
+    int tileWidths[] = { 2, 5, 10, 15, 25 };
 
-    printf("Matrix Size, Tile Width, Kernel Time (ms)\n");
+    printf("Matrix Size,  Tile Width,  Kernel Time (ms)\n");
 
     for (int s = 0; s < 5; s++)
     {
@@ -134,13 +138,20 @@ int main()
         initMatrix(h_M, Width);
         initMatrix(h_N, Width);
 
-        matrixMultiply(h_P, h_M, h_N, Width);
-        cpuMatMul(h_CPU, h_M, h_N, Width);
+        for (int t = 0; t < 5; t++)
+        {
+            int TILE_WIDTH = tileWidths[t];
 
-        if (checkResult(h_P, h_CPU, Width))
-            printf("Test PASSED\n");
-        else
-            printf("Test FAILED\n");
+            // GPU multiplication
+            matrixMultiply(h_P, h_M, h_N, Width, TILE_WIDTH);
+            
+            cpuMatMul(h_CPU, h_M, h_N, Width);
+
+            if (checkResult(h_P, h_CPU, Width))
+                printf("Test PASSED\n");
+            else
+                printf("Test FAILED\n");
+        }
 
         free(h_M);
         free(h_N);
