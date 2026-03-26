@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 #include <math.h>
 
+#define TILE_WIDTH 10
 #define TOL 1e-2f
 
 void initMatrix(float* A, int n)
@@ -35,19 +36,16 @@ int checkResult(const float* A, const float* B, int n)
     return 1;
 }
 
-template <int TILE_WIDTH>
 __global__ void MatrixMulKernel(float* M, float* N, float* P, int Width)
 {
     __shared__ float Mds[TILE_WIDTH][TILE_WIDTH];
     __shared__ float Nds[TILE_WIDTH][TILE_WIDTH];
 
-    int bx = blockIdx.x;
-    int by = blockIdx.y;
     int tx = threadIdx.x;
     int ty = threadIdx.y;
 
-    int Row = by * TILE_WIDTH + ty;
-    int Col = bx * TILE_WIDTH + tx;
+    int Row = blockIdx.y * TILE_WIDTH + ty;
+    int Col = blockIdx.x * TILE_WIDTH + tx;
 
     float Pvalue = 0.0f;
     int phases = (Width + TILE_WIDTH - 1) / TILE_WIDTH;
@@ -76,7 +74,7 @@ __global__ void MatrixMulKernel(float* M, float* N, float* P, int Width)
         P[Row * Width + Col] = Pvalue;
 }
 
-void matrixMultiply(float* h_P, float* h_M, float* h_N, int Width, int TILE_WIDTH)
+void matrixMultiply(float* h_P, float* h_M, float* h_N, int Width)
 {
     float *d_M, *d_N, *d_P;
     int size = Width * Width * sizeof(float);
@@ -92,16 +90,25 @@ void matrixMultiply(float* h_P, float* h_M, float* h_N, int Width, int TILE_WIDT
     dim3 dimGrid(numBlocks, numBlocks);
     dim3 dimBlock(TILE_WIDTH, TILE_WIDTH);
 
-    switch (TILE_WIDTH)
-    {
-        case 2:  MatrixMulKernel<2><<<dimGrid, dimBlock>>>(d_M, d_N, d_P, Width); break;
-        case 5:  MatrixMulKernel<5><<<dimGrid, dimBlock>>>(d_M, d_N, d_P, Width); break;
-        case 10: MatrixMulKernel<10><<<dimGrid, dimBlock>>>(d_M, d_N, d_P, Width); break;
-        case 15: MatrixMulKernel<15><<<dimGrid, dimBlock>>>(d_M, d_N, d_P, Width); break;
-        case 25: MatrixMulKernel<25><<<dimGrid, dimBlock>>>(d_M, d_N, d_P, Width); break;
-    }
+    cudaEvent_t start, stop;
+    float ms;
+
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    cudaEventRecord(start);
+    MatrixMulKernel<<<dimGrid, dimBlock>>>(d_M, d_N, d_P, Width);
+    cudaEventRecord(stop);
+
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&ms, start, stop);
 
     cudaMemcpy(h_P, d_P, size, cudaMemcpyDeviceToHost);
+
+    printf("%d, %d, %f\n", Width, TILE_WIDTH, ms);
+
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
 
     cudaFree(d_M);
     cudaFree(d_N);
@@ -110,31 +117,36 @@ void matrixMultiply(float* h_P, float* h_M, float* h_N, int Width, int TILE_WIDT
 
 int main()
 {
-    int Width = 300;   // change this
-    int TILE_WIDTH = 10; // change this
+    int sizes[] = {300, 750, 1500, 3000, 4500};
 
-    int size = Width * Width * sizeof(float);
+    printf("Matrix Size, Tile Width, Kernel Time (ms)\n");
 
-    float* h_M = (float*)malloc(size);
-    float* h_N = (float*)malloc(size);
-    float* h_P = (float*)malloc(size);
-    float* h_CPU = (float*)malloc(size);
+    for (int s = 0; s < 5; s++)
+    {
+        int Width = sizes[s];
+        int size = Width * Width * sizeof(float);
 
-    initMatrix(h_M, Width);
-    initMatrix(h_N, Width);
+        float* h_M = (float*)malloc(size);
+        float* h_N = (float*)malloc(size);
+        float* h_P = (float*)malloc(size);
+        float* h_CPU = (float*)malloc(size);
 
-    matrixMultiply(h_P, h_M, h_N, Width, TILE_WIDTH);
-    cpuMatMul(h_CPU, h_M, h_N, Width);
+        initMatrix(h_M, Width);
+        initMatrix(h_N, Width);
 
-    if (checkResult(h_P, h_CPU, Width))
-        printf("Test PASSED\n");
-    else
-        printf("Test FAILED\n");
+        matrixMultiply(h_P, h_M, h_N, Width);
+        cpuMatMul(h_CPU, h_M, h_N, Width);
 
-    free(h_M);
-    free(h_N);
-    free(h_P);
-    free(h_CPU);
+        if (checkResult(h_P, h_CPU, Width))
+            printf("Test PASSED\n");
+        else
+            printf("Test FAILED\n");
+
+        free(h_M);
+        free(h_N);
+        free(h_P);
+        free(h_CPU);
+    }
 
     return 0;
 }
