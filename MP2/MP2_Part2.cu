@@ -8,14 +8,12 @@
 #define MAX_TILE_HEIGHT 32
 #define MAX_TILE_WIDTH 32
 
-// Initialize matrix with random floats
 void initMatrix(float* A, int rows, int cols)
 {
     for (int i = 0; i < rows * cols; i++)
         A[i] = (float)rand() / RAND_MAX;
 }
 
-// General tiled matrix multiplication kernel with boundary checks
 __global__ void MatrixMulKernelGeneral(float* M, float* N, float* P,
     int rows_M, int cols_M, int cols_N,
     int TILE_HEIGHT, int TILE_WIDTH)
@@ -52,7 +50,6 @@ __global__ void MatrixMulKernelGeneral(float* M, float* N, float* P,
         P[Row * cols_N + Col] = Pvalue;
 }
 
-// Host function to run GPU matrix multiplication and measure kernel time
 void matrixMultiplyGPU(float* h_P, float* h_M, float* h_N,
     int rows_M, int cols_M, int cols_N,
     int TILE_HEIGHT, int TILE_WIDTH)
