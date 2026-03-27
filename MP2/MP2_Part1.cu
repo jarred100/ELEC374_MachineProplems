@@ -7,7 +7,7 @@
 #include <math.h>
 
 #define TOL 1e-2f
-#define MAX_TILE 25   // Maximum tile size allowed
+#define MAX_TILE 25
 
 void initMatrix(float* A, int n)
 {
@@ -141,18 +141,13 @@ int main()
         for (int t = 0; t < 5; t++)
         {
             int TILE_WIDTH = tileWidths[t];
-
-            // GPU multiplication
             matrixMultiply(h_P, h_M, h_N, Width, TILE_WIDTH);
-            
             cpuMatMul(h_CPU, h_M, h_N, Width);
-
             if (checkResult(h_P, h_CPU, Width))
                 printf("Test PASSED\n");
             else
                 printf("Test FAILED\n");
         }
-
         free(h_M);
         free(h_N);
         free(h_P);
